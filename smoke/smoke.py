@@ -4,7 +4,9 @@
 1. GET /healthz 返回 200 且 status=ok；
 2. 可行草稿返回 feasible=true，守恒/范围/目标值全部成立，流量为整数；
 3. 不可行草稿返回 feasible=false 且给出收支诊断；
-4. 非法草稿返回 HTTP 400。
+4. 非法草稿返回 HTTP 400；
+5. 韧性计划：可行（含统一增设方案与各故障重配平）、无解（明确故障情形）、
+   输入错误 400。
 
 由容器内 exec 执行，默认访问本机 8000；可用 BASE_URL 覆盖。
 任何断言失败即以非零退出码报告。
@@ -101,6 +103,78 @@ def main():
     status, r = request("POST", "/api/balance", bad_payload)
     check(status == 400 and "error" in r,
           f"非法草稿返回 400（实际 {status}）")
+
+    # ---- 韧性计划 ----
+    # 网络：S->N 10；N->A(p2)、N->B(p3)；另加 S->A 直连管 p4(0..0)。
+    # p2 停用时 A 只能靠 p4，需给 p4 加装至少 6 才能继续满足 A=6。
+    plan_payload = {
+        "source": {"id": "S"},
+        "source_total": 10,
+        "zones": [{"id": "A", "demand": 6}, {"id": "B", "demand": 4}],
+        "nodes": [{"id": "N"}],
+        "pipes": [
+            {"id": "p1", "from": "S", "to": "N",
+             "min": 0, "max": 10, "preferred": 5},
+            {"id": "p2", "from": "N", "to": "A",
+             "min": 0, "max": 10, "preferred": 3},
+            {"id": "p3", "from": "N", "to": "B",
+             "min": 0, "max": 10, "preferred": 7},
+            {"id": "p4", "from": "S", "to": "A",
+             "min": 0, "max": 0, "preferred": 0},
+        ],
+        "total_budget": 10,
+        "contingencies": [
+            {"pipe_id": "p2", "add_max": 8, "unit_cost": 3},
+            {"pipe_id": "p4", "add_max": 8, "unit_cost": 1},
+        ],
+    }
+    status, r = request("POST", "/api/plan", plan_payload)
+    check(status == 200, f"韧性计划 HTTP 200（实际 {status}）")
+    check(r["feasible"] is True, "韧性计划结论为可行")
+    check(r["plan"]["add_sequence"] == [0, 6],
+          f"统一增设序列 [0,6]（实际 {r['plan']['add_sequence']}）")
+    check(r["plan"]["total_cost"] == 6,
+          f"增设成本 6（实际 {r['plan']['total_cost']}）")
+    check(len(r["contingencies"]) == 2, "给出 2 个故障情形的重算结果")
+    for c in r["contingencies"]:
+        check(c["feasible"] is True, f"故障 {c['pipe_id']} 情形可行")
+        disabled = [f for f in c["flows"] if f.get("disabled")]
+        check(len(disabled) == 1 and disabled[0]["flow"] == 0,
+              f"故障 {c['pipe_id']} 停用管流量固定为 0")
+        for zrow in c["balances"]["zones"]:
+            check(zrow["difference"] == 0,
+                  f"故障 {c['pipe_id']} 分区 {zrow['id']} 精确满足需求")
+        check(all(n["difference"] == 0
+                  for n in c["balances"]["nodes"]),
+              f"故障 {c['pipe_id']} 节点守恒")
+
+    # 无解：总量上限只给 3，p2 故障时 p4 至少需加 6
+    infeasible_plan = json.loads(json.dumps(plan_payload))
+    infeasible_plan["total_budget"] = 3
+    status, r = request("POST", "/api/plan", infeasible_plan)
+    check(status == 200 and r["feasible"] is False,
+          "预算不足判为计划无解（HTTP 200 业务结论）")
+    check(bool(r["uncovered"]) and r["plan"] is None,
+          "明确列出无法覆盖的故障情形")
+    check(any(u["pipe_id"] == "p2" for u in r["uncovered"]),
+          "无解故障为 p2 停用情形")
+
+    # 输入错误：候选管不存在 / 数量超界 / 非整数
+    bad_plan = json.loads(json.dumps(plan_payload))
+    bad_plan["contingencies"][0]["pipe_id"] = "GHOST"
+    status, r = request("POST", "/api/plan", bad_plan)
+    check(status == 400 and "error" in r,
+          f"候选管不存在返回 400（实际 {status}）")
+
+    bad_plan = json.loads(json.dumps(plan_payload))
+    bad_plan["contingencies"] = []
+    status, r = request("POST", "/api/plan", bad_plan)
+    check(status == 400, "候选为空返回 400")
+
+    bad_plan = json.loads(json.dumps(plan_payload))
+    bad_plan["total_budget"] = -2
+    status, r = request("POST", "/api/plan", bad_plan)
+    check(status == 400, "负总量上限返回 400")
 
     print("[smoke] 全部冒烟断言通过")
 

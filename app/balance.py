@@ -175,6 +175,21 @@ def validate_and_build(payload: Any) -> Dict[str, Any]:
 def solve(payload: Any) -> Dict[str, Any]:
     """求配平结果。校验失败由调用方转 400。"""
     model = validate_and_build(payload)
+    return compute(model)
+
+
+def compute(model: Dict[str, Any], add: Dict[int, int] | None = None,
+            disabled: frozenset | None = None) -> Dict[str, Any]:
+    """在内部模型上求整数最优配平。
+
+    供韧性计划复用：
+    - ``add``：{管路序号: 增设通量}，该管路最大量临时上调；
+    - ``disabled``：被停用的管路序号集合，其流量强制为 0（不参与预流，
+      也没有任何调整边）。
+    普通配平两者均为空，行为与历史接口完全一致。
+    """
+    add = add or {}
+    disabled = disabled or frozenset()
     source_id = model["source_id"]
     total: int = model["total"]
     zones: List[Dict[str, Any]] = model["zones"]
@@ -195,25 +210,34 @@ def solve(payload: Any) -> Dict[str, Any]:
     mcf = MinCostFlow(tt + 1)
 
     # 分层权重：字典序决胜权重 q，主偏差权重 P
+    # 停用管流量恒为 0（取值区间宽度为 0），不影响任何权重。
     m = len(pipes)
     q = [0] * m
     weight = 0
     for i in range(m - 1, -1, -1):
         q[i] = weight + 1
-        weight += q[i] * (pipes[i]["max"] - pipes[i]["min"])
+        if i in disabled:
+            span = 0
+        else:
+            span = pipes[i]["max"] + add.get(i, 0) - pipes[i]["min"]
+        weight += q[i] * span
     primary_p = weight + 1
 
     # ---- 优选量预流，b(v)=优选流入-优选流出 ----
     balance = {vid: 0 for vid in business}
-    # (起点, 增大边序号, 反向起点 v, 减小边序号)
-    adj_refs: List[Tuple[int, int, int, int]] = []
+    # (起点, 增大边序号, 反向起点 v, 减小边序号)；停用管无调整边
+    adj_refs: List[Tuple[int, int, int, int] | None] = []
     for i, p in enumerate(pipes):
+        if i in disabled:
+            adj_refs.append(None)
+            continue
         u = idx[p["from"]]
         v = idx[p["to"]]
         pref = p["preferred"]
+        hi = p["max"] + add.get(i, 0)
         # 增大边 u→v
         e_up = len(mcf.g[u])
-        mcf.add_edge(u, v, p["max"] - pref, primary_p + q[i])
+        mcf.add_edge(u, v, hi - pref, primary_p + q[i])
         # 减小边 v→u
         e_down = len(mcf.g[v])
         mcf.add_edge(v, u, pref - p["min"], primary_p - q[i])
@@ -265,33 +289,48 @@ def solve(payload: Any) -> Dict[str, Any]:
                            ss_total, tt_total, pushed, kind_of, idx, demand_of)
 
     flows: List[int] = []
-    for p, (u, e_up, v, e_down) in zip(pipes, adj_refs):
+    for i, (p, ref) in enumerate(zip(pipes, adj_refs)):
+        if ref is None:
+            flows.append(0)  # 停用管流量恒为 0
+            continue
+        u, e_up, v, e_down = ref
         up_used = mcf.used_flow(u, e_up)
         down_used = mcf.used_flow(v, e_down)
         flows.append(p["preferred"] + up_used - down_used)
 
-    return _feasible(base, flows, idx)
+    return _feasible(base, flows, idx, add, disabled)
 
 
 def _feasible(base: Dict[str, Any], flows: List[int],
-              idx: Dict[str, int]) -> Dict[str, Any]:
+              idx: Dict[str, int],
+              add: Dict[int, int] | None = None,
+              disabled: frozenset | None = frozenset()) -> Dict[str, Any]:
+    add = add or {}
+    disabled = disabled or frozenset()
     pipes = base["pipes"]
     inflow: Dict[str, int] = {v: 0 for v in idx}
     outflow: Dict[str, int] = {v: 0 for v in idx}
 
     flow_rows = []
     deviation = 0
-    for p, f in zip(pipes, flows):
+    for i, (p, f) in enumerate(zip(pipes, flows)):
         dev = abs(f - p["preferred"])
         deviation += dev
         outflow[p["from"]] += f
         inflow[p["to"]] += f
-        flow_rows.append({
+        row = {
             "pipe_id": p["id"], "order": p["order"],
             "from": p["from"], "to": p["to"],
             "min": p["min"], "max": p["max"],
             "preferred": p["preferred"], "flow": f, "deviation": dev,
-        })
+        }
+        # 韧性计划故障重算时补充运行态信息（普通配平输出保持原样）
+        if i in disabled:
+            row["disabled"] = True
+        if add.get(i, 0) > 0:
+            row["added_capacity"] = add[i]
+            row["effective_max"] = p["max"] + add[i]
+        flow_rows.append(row)
 
     sid = base["source_id"]
     node_rows = [{

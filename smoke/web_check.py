@@ -45,6 +45,34 @@ def main():
     if resp.status != 200 or not data.get("feasible"):
         fail(f"经 nginx 的业务配平失败：{data}")
     print(f"  ✓ POST /api/balance 经 nginx 透传成功，序列 {data['tie_sequence']}")
+
+    # 韧性计划同样经 /api/ 透传：一个可行的小计划
+    plan_payload = {
+        "source": {"id": "S"}, "source_total": 10,
+        "zones": [{"id": "A", "demand": 6}, {"id": "B", "demand": 4}],
+        "nodes": [{"id": "N"}],
+        "pipes": [
+            {"id": "p1", "from": "S", "to": "N", "min": 0, "max": 10, "preferred": 5},
+            {"id": "p2", "from": "N", "to": "A", "min": 0, "max": 10, "preferred": 3},
+            {"id": "p3", "from": "N", "to": "B", "min": 0, "max": 10, "preferred": 7},
+            {"id": "p4", "from": "S", "to": "A", "min": 0, "max": 0, "preferred": 0},
+        ],
+        "total_budget": 10,
+        "contingencies": [
+            {"pipe_id": "p2", "add_max": 8, "unit_cost": 1},
+            {"pipe_id": "p4", "add_max": 8, "unit_cost": 1},
+        ],
+    }
+    req = urllib.request.Request(
+        BASE + "/api/plan",
+        data=json.dumps(plan_payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if resp.status != 200 or not data.get("feasible"):
+        fail(f"经 nginx 的韧性计划失败：{data}")
+    print(f"  ✓ POST /api/plan 经 nginx 透传成功，增设序列 "
+          f"{data['plan']['add_sequence']}")
     print("[web-smoke] Web/API 联调全部通过")
 
 

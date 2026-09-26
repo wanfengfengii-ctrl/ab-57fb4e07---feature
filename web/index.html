@@ -81,6 +81,13 @@
     border-radius: 4px; font-size: 12px; padding: 0 4px;
   }
   .del { color: var(--bad); cursor: pointer; border: none; background: none; font-size: 13px; }
+  .add-tag {
+    display: inline-block; font-size: 11px; color: var(--good);
+    background: var(--accent-soft); border-radius: 4px; padding: 0 4px;
+  }
+  .disabled-row { background: var(--bad-soft); }
+  .disabled-row .flow-cell { color: var(--bad); }
+  .scenario { margin-top: 18px; padding-top: 4px; border-top: 1px dashed var(--line); }
 </style>
 </head>
 <body>
@@ -141,6 +148,29 @@
     </div>
   </section>
 
+  <section class="card">
+    <div class="actions" style="justify-content: space-between">
+      <h2 style="margin:0">韧性计划（可选）</h2>
+      <button class="btn" id="btn-plan" type="button">发起韧性计划</button>
+    </div>
+    <p class="hint">回湿前评估：勾选 <b>1~4 条</b>可能临时停用的既有管路，填写每条管路<b>可增设的非负整数上限</b>与<b>每单位增设成本</b>，并给出<b>全网备用增设总量上限</b>。服务端以当前完整草稿联合决定统一增设方案，并对每条所选管路单独停用的情形重算配平（停用管流量固定为 0）。多个可行计划依次取成本最低、总增设量最少、按录入顺序的增设序列字典序最小。</p>
+    <div id="plan-form-error"></div>
+    <div class="row">
+      <label>全网备用总量上限
+        <input type="number" id="plan-budget" min="0" step="1" value="10">
+      </label>
+      <span class="hint" id="plan-count"></span>
+    </div>
+    <table style="margin-top:8px">
+      <thead><tr>
+        <th style="width:34px">#</th><th>管路</th><th>方向</th>
+        <th class="num">可增设上限</th><th class="num">单位增设成本</th><th>纳入候选</th>
+      </tr></thead>
+      <tbody id="plan-body"></tbody>
+    </table>
+  </section>
+
+  <section id="plan-result"></section>
   <section id="result"></section>
 </main>
 
@@ -221,6 +251,61 @@ function render() {
   $("btn-add-zone").disabled = state.zones.length >= 4;
   $("btn-add-node").disabled = state.nodes.length >= 4;
   $("btn-add-pipe").disabled = state.pipes.length >= 10;
+  renderPlan();
+}
+
+// ---- 韧性计划候选状态：按管路 id 记录 {sel, addMax, unitCost} ----
+const planCand = {};
+
+function candOf(p) {
+  if (!planCand[p.id]) planCand[p.id] = { sel: false, addMax: 5, unitCost: 1 };
+  return planCand[p.id];
+}
+
+function selectedCandidates() {
+  // 按管路录入顺序输出
+  const out = [];
+  state.pipes.forEach((p) => {
+    const c = planCand[p.id];
+    if (c && c.sel) {
+      out.push({ pipe_id: p.id, add_max: c.addMax, unit_cost: c.unitCost });
+    }
+  });
+  return out;
+}
+
+window.updateCand = (id, key, val) => {
+  const c = planCand[id];
+  if (!c) return;
+  if (key === "sel") c.sel = val;
+  else c[key] = Number(val);
+  updatePlanCount();
+};
+
+function updatePlanCount() {
+  const n = selectedCandidates().length;
+  const el = $("plan-count");
+  el.textContent = `已纳入候选 ${n} 条（须 1~4 条）`;
+  el.style.color = (n >= 1 && n <= 4) ? "var(--muted)" : "var(--warn)";
+}
+
+function renderPlan() {
+  $("plan-body").innerHTML = state.pipes.map((p, i) => {
+    const c = candOf(p);
+    return `
+    <tr class="pipe-row">
+      <td><span class="order-tag">${i + 1}</span></td>
+      <td>${esc(p.id)}</td>
+      <td>${esc(p.from)} <span class="arrow">→</span> ${esc(p.to)}</td>
+      <td class="num"><input type="number" min="0" step="1" value="${c.addMax}"
+        onchange="updateCand('${esc(p.id)}','addMax',this.value)"></td>
+      <td class="num"><input type="number" min="0" step="1" value="${c.unitCost}"
+        onchange="updateCand('${esc(p.id)}','unitCost',this.value)"></td>
+      <td><input type="checkbox" ${c.sel ? "checked" : ""}
+        onchange="updateCand('${esc(p.id)}','sel',this.checked)"></td>
+    </tr>`;
+  }).join("");
+  updatePlanCount();
 }
 
 function syncSource() {
@@ -453,6 +538,179 @@ $("btn-run").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
     btn.textContent = "发起配平";
+  }
+});
+
+// ---- 韧性计划结果渲染 ----
+function flowTable(flows) {
+  const rows = flows.map((f) => `
+    <tr${f.disabled ? ' class="disabled-row"' : ""}>
+      <td><span class="order-tag">${f.order + 1}</span></td>
+      <td>${esc(f.pipe_id)}</td>
+      <td>${esc(f.from)} <span class="arrow">→</span> ${esc(f.to)}</td>
+      <td class="num">${f.min}</td>
+      <td class="num muted">${f.preferred}</td>
+      <td class="num">${f.max}${f.added_capacity
+        ? ` <span class="add-tag">+${f.added_capacity}→${f.effective_max}</span>`
+        : ""}</td>
+      <td class="num flow-cell">${f.disabled ? "停用" : f.flow}</td>
+      <td class="num">${f.deviation}</td>
+    </tr>`).join("");
+  return `
+    <table>
+      <thead><tr>
+        <th style="width:34px">#</th><th>管路</th><th>方向</th>
+        <th class="num">最小量</th><th class="num">优选量</th><th class="num">最大量</th>
+        <th class="num">配平流量</th><th class="num">偏差</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function balanceRows(bal) {
+  const src = bal.source;
+  const nodesHtml = bal.nodes.length
+    ? bal.nodes.map((n) => `
+      <tr><td>${esc(n.id)} <span class="muted">分流节点</span></td>
+        <td class="num">${n.inflow}</td><td class="num">${n.outflow}</td>
+        ${diffCell(n.difference)}</tr>`).join("")
+    : "";
+  const zonesHtml = bal.zones.map((z) => `
+      <tr><td>${esc(z.id)} <span class="muted">分区</span></td>
+        <td class="num">${z.inflow}</td><td class="num">${z.demand}</td>
+        ${diffCell(z.difference)}</tr>`).join("");
+  return `
+    <table>
+      <thead><tr><th>节点</th><th class="num">流入</th><th class="num">流出/需求</th><th class="num">收-支 差额</th></tr></thead>
+      <tbody>
+        <tr><td>${esc(src.id)} <span class="muted">水源</span></td>
+          <td class="num">—</td><td class="num">${src.outflow} / 总量 ${src.total}</td>
+          ${diffCell(src.difference)}</tr>
+        ${nodesHtml}${zonesHtml}
+      </tbody>
+    </table>`;
+}
+
+function renderPlanFeasible(r) {
+  const plan = r.plan;
+  const seq = plan.add_sequence.map((x) => esc(x)).join(", ");
+  const addRows = plan.additions.map((a) => `
+    <tr>
+      <td><span class="order-tag">${a.pipe_order + 1}</span></td>
+      <td>${esc(a.pipe_id)}</td>
+      <td class="num">${a.add_max}</td>
+      <td class="num">${a.unit_cost}</td>
+      <td class="num flow-cell">${a.added}</td>
+      <td class="num">${a.added_cost}</td>
+    </tr>`).join("");
+
+  const scenarios = r.contingencies.map((c) => `
+    <div class="scenario">
+      <h2 style="margin-top:16px">故障情形：管路 <b>${esc(c.pipe_id)}</b> 单独停用
+        <span class="badge ok">可配平</span></h2>
+      <p class="hint">决胜流量序列：<span class="seq">[${
+        c.tie_sequence.map(esc).join(", ")}]</span>　偏差和 ${c.objective}</p>
+      ${flowTable(c.flows)}
+      <h2 style="margin-top:10px">分区与节点收支</h2>
+      ${balanceRows(c.balances)}
+    </div>`).join("");
+
+  $("plan-result").innerHTML = `
+    <section class="card">
+      <h2>韧性计划结果　<span class="badge ok">可行</span></h2>
+      <p>${esc(r.message)}</p>
+      <div class="row" style="gap:24px">
+        <span class="hint">增设总成本：<b>${plan.total_cost}</b></span>
+        <span class="hint">总增设量：<b>${plan.total_added}</b> / 上限 ${r.total_budget}</span>
+        <span class="hint">剩余备用量：<b>${plan.budget_remaining}</b></span>
+      </div>
+      <p class="hint" style="margin-top:8px">
+        统一增设方案（按管路录入顺序）：<span class="seq">[${seq}]</span>
+      </p>
+      <table>
+        <thead><tr>
+          <th style="width:34px">#</th><th>管路</th>
+          <th class="num">可增设上限</th><th class="num">单位成本</th>
+          <th class="num">决定增设</th><th class="num">增设成本</th>
+        </tr></thead>
+        <tbody>${addRows}</tbody>
+      </table>
+      ${scenarios}
+    </section>`;
+}
+
+function renderPlanInfeasible(r) {
+  const rows = r.uncovered.map((u) => `
+    <tr>
+      <td><span class="order-tag">${u.pipe_order + 1}</span></td>
+      <td>${esc(u.pipe_id)}</td>
+      <td>${esc(u.reason)}</td>
+    </tr>`).join("");
+  $("plan-result").innerHTML = `
+    <section class="card">
+      <h2>韧性计划结果　<span class="badge no">无解</span></h2>
+      <div class="banner warn">${esc(r.message)}</div>
+      <p class="hint">全网备用总量上限：<b>${r.total_budget}</b></p>
+      <table>
+        <thead><tr><th style="width:34px">#</th><th>无法覆盖的故障情形（停用管路）</th><th>说明</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="3" class="muted">无</td></tr>'}</tbody>
+      </table>
+      <p class="hint" style="margin-top:10px">
+        提示：可放宽相关管路的可增设上限、上调全网备用总量上限，或检查故障后是否仍有连通路径。
+      </p>
+    </section>`;
+}
+
+$("btn-plan").addEventListener("click", async () => {
+  const errBox = $("plan-form-error");
+  errBox.innerHTML = "";
+  $("plan-result").innerHTML = "";
+  const cands = selectedCandidates();
+  if (cands.length < 1 || cands.length > 4) {
+    errBox.innerHTML = `<div class="banner error">请勾选 1~4 条可能失效的管路作为候选。</div>`;
+    return;
+  }
+  for (const c of cands) {
+    if (!Number.isInteger(c.add_max) || c.add_max < 0
+        || !Number.isInteger(c.unit_cost) || c.unit_cost < 0) {
+      errBox.innerHTML = `<div class="banner error">管路 ${esc(c.pipe_id)} 的可增设上限与单位成本必须是非负整数。</div>`;
+      return;
+    }
+  }
+  const budget = Number($("plan-budget").value);
+  if (!Number.isInteger(budget) || budget < 0) {
+    errBox.innerHTML = `<div class="banner error">全网备用总量上限必须是非负整数。</div>`;
+    return;
+  }
+
+  const btn = $("btn-plan");
+  btn.disabled = true;
+  btn.textContent = "计算中…";
+  try {
+    const payload = buildPayload();
+    payload.total_budget = budget;
+    payload.contingencies = cands;
+    const resp = await fetch("/api/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (resp.status === 400) {
+      errBox.innerHTML = `<div class="banner error">计划请求未通过校验：${esc(data.error)}</div>`;
+      return;
+    }
+    if (!resp.ok) {
+      errBox.innerHTML = `<div class="banner error">服务异常（HTTP ${resp.status}），请稍后重试。</div>`;
+      return;
+    }
+    if (data.feasible) renderPlanFeasible(data);
+    else renderPlanInfeasible(data);
+  } catch (e) {
+    errBox.innerHTML = `<div class="banner error">无法连接配平服务：${esc(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "发起韧性计划";
   }
 });
 
