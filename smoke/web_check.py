@@ -45,6 +45,23 @@ def main():
     if resp.status != 200 or not data.get("feasible"):
         fail(f"经 nginx 的业务配平失败：{data}")
     print(f"  ✓ POST /api/balance 经 nginx 透传成功，序列 {data['tie_sequence']}")
+
+    plan_payload = dict(payload)
+    plan_payload["reserve_total"] = 20
+    plan_payload["candidates"] = [
+        {"pipe_id": "p1", "add_max": 20, "unit_cost": 1},
+        {"pipe_id": "p4", "add_max": 20, "unit_cost": 1},
+    ]
+    req = urllib.request.Request(
+        BASE + "/api/plan",
+        data=json.dumps(plan_payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        plan = json.loads(resp.read().decode("utf-8"))
+    if resp.status != 200 or "feasible" not in plan or "scenarios" not in plan:
+        fail(f"经 nginx 的韧性计划失败：{plan}")
+    print(f"  ✓ POST /api/plan 经 nginx 透传成功，feasible={plan['feasible']}，"
+          f"情形数 {len(plan['scenarios'])}")
     print("[web-smoke] Web/API 联调全部通过")
 
 

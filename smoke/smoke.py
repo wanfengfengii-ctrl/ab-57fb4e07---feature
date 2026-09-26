@@ -102,6 +102,82 @@ def main():
     check(status == 400 and "error" in r,
           f"非法草稿返回 400（实际 {status}）")
 
+    # ---- 韧性计划 /api/plan ----
+    plan_base = {
+        "source": {"id": "S"}, "source_total": 10,
+        "zones": [{"id": "A", "demand": 6}, {"id": "B", "demand": 4}],
+        "nodes": [{"id": "N"}],
+        "pipes": [
+            {"id": "p1", "from": "S", "to": "N",
+             "min": 0, "max": 10, "preferred": 5},
+            {"id": "p2", "from": "N", "to": "A",
+             "min": 0, "max": 10, "preferred": 3},
+            {"id": "p3", "from": "N", "to": "B",
+             "min": 0, "max": 10, "preferred": 7},
+            {"id": "p4", "from": "S", "to": "A",
+             "min": 0, "max": 0, "preferred": 0},
+            {"id": "p5", "from": "S", "to": "B",
+             "min": 0, "max": 0, "preferred": 0},
+        ],
+    }
+
+    # 可行：p1 停用需 p4/p5 直达扩容（p4=6、p5=4），成本 10
+    feasible_plan = dict(plan_base)
+    feasible_plan["reserve_total"] = 20
+    feasible_plan["candidates"] = [
+        {"pipe_id": "p1", "add_max": 20, "unit_cost": 5},
+        {"pipe_id": "p4", "add_max": 20, "unit_cost": 1},
+        {"pipe_id": "p5", "add_max": 20, "unit_cost": 1},
+    ]
+    status, r = request("POST", "/api/plan", feasible_plan)
+    check(status == 200 and r["feasible"] is True,
+          f"韧性计划可行（实际 {status}, feasible={r.get('feasible')}）")
+    amounts = {a["pipe_id"]: a["amount"] for a in r["additions"]}
+    check(amounts.get("p4") == 6 and amounts.get("p5") == 4
+          and amounts.get("p1") == 0,
+          f"增设量 p4=6、p5=4、p1=0（实际 {amounts}）")
+    check(r["total_cost"] == 10 and r["total_added"] == 10,
+          f"总成本 10、总增设量 10（实际 {r['total_cost']}/{r['total_added']}）")
+    check(len(r["scenarios"]) == 3
+          and all(s["feasible"] for s in r["scenarios"]),
+          "3 种故障情形全部可配平")
+    for s in r["scenarios"]:
+        pid = s["disabled_pipe_id"]
+        row = next(f for f in s["flows"] if f["pipe_id"] == pid)
+        check(row["flow"] == 0 and row["max"] == 0,
+              f"情形 {pid}：停用管流量为 0 且范围固定为 0")
+        z = {x["id"]: x for x in s["balances"]["zones"]}
+        check(z["A"]["difference"] == 0 and z["B"]["difference"] == 0,
+              f"情形 {pid}：各分区收支差额为 0")
+
+    # 无解：p1 是 N 的唯一进水、p3 是 B 的唯一进水，停用无法靠增设弥补
+    infeasible_plan = json.loads(json.dumps(plan_base))
+    infeasible_plan["pipes"] = infeasible_plan["pipes"][:4]  # 去掉 p5
+    infeasible_plan["reserve_total"] = 20
+    infeasible_plan["candidates"] = [
+        {"pipe_id": "p1", "add_max": 20, "unit_cost": 1},
+        {"pipe_id": "p3", "add_max": 20, "unit_cost": 1},
+    ]
+    status, r = request("POST", "/api/plan", infeasible_plan)
+    check(status == 200 and r["feasible"] is False,
+          "结构性单点故障判为无解（HTTP 200 业务结论）")
+    check(set(r["uncovered_scenarios"]) == {"p1", "p3"},
+          f"明确报告无法覆盖的情形 p1、p3（实际 {r['uncovered_scenarios']}）")
+    check(bool(r["reasons"]), "给出可读的无解原因")
+
+    # 输入错误：候选管路数量越界 / 备用总量为负 / 候选管不存在
+    for bad in (
+        {**feasible_plan, "candidates": []},
+        {**feasible_plan, "reserve_total": -1},
+        {**feasible_plan,
+         "candidates": [{"pipe_id": "ghost", "add_max": 1, "unit_cost": 1}]},
+        {**feasible_plan,
+         "candidates": [{"pipe_id": "p1", "add_max": 2.5, "unit_cost": 1}]},
+    ):
+        status, r = request("POST", "/api/plan", bad)
+        check(status == 400 and "error" in r,
+              f"非法计划参数返回 400（实际 {status}）")
+
     print("[smoke] 全部冒烟断言通过")
 
 

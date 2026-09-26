@@ -81,6 +81,18 @@
     border-radius: 4px; font-size: 12px; padding: 0 4px;
   }
   .del { color: var(--bad); cursor: pointer; border: none; background: none; font-size: 13px; }
+  input.tiny { width: 64px; padding: 3px 6px; font-size: 12.5px; }
+  .cand-cell { white-space: nowrap; }
+  .cand-cell .cap { display: inline-flex; align-items: center; gap: 3px; margin-left: 8px; }
+  .cand-cell .cap span { font-size: 11.5px; color: var(--muted); }
+  .scenario {
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 14px; margin-top: 14px; background: #fff;
+  }
+  .scenario h3 { margin: 0 0 8px; font-size: 14px; }
+  .scenario h4 { margin: 12px 0 6px; font-size: 13px; color: var(--muted); }
+  .plan-summary { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 8px 0 4px; }
+  .plan-summary b { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -128,11 +140,12 @@
     </div>
 
     <h2 style="margin-top:16px">管路（4 ~ 10 条，按方向连接）</h2>
-    <p class="hint">顺序即录入顺序，参与最优解的稳定决胜；可用 ↑/↓ 调整。起点只能是水源或分流节点，终点只能是分流节点或分区。</p>
+    <p class="hint">顺序即录入顺序，参与最优解的稳定决胜；可用 ↑/↓ 调整。起点只能是水源或分流节点，终点只能是分流节点或分区。勾选"候选"的管路进入下方韧性计划（可填增设上限与单位成本）。</p>
     <table>
       <thead><tr>
         <th style="width:34px">#</th><th>管路编号</th><th>起点</th><th></th><th>终点</th>
-        <th class="num">最小量</th><th class="num">优选量</th><th class="num">最大量</th><th></th>
+        <th class="num">最小量</th><th class="num">优选量</th><th class="num">最大量</th>
+        <th>韧性候选</th><th></th>
       </tr></thead>
       <tbody id="pipe-body"></tbody>
     </table>
@@ -141,7 +154,28 @@
     </div>
   </section>
 
+  <section class="card">
+    <div class="actions" style="justify-content: space-between">
+      <h2 style="margin:0">韧性计划（关键管路停用备份）</h2>
+      <button class="btn" id="btn-plan" type="button">发起韧性计划</button>
+    </div>
+    <p class="hint" style="margin-top:8px">
+      在上方管路表中勾选 1 ~ 4 条"可能失效"的候选管路并填写每条的增设上限与单位成本；
+      服务端联合决定各候选管的整数增设量，使任一候选管单独停用（流量固定为 0）时，
+      其余管路仍能满足各分区定量需求。多个可行计划依次取：增设成本最低、
+      总增设量最少、按管路录入顺序的增设序列字典序最小。
+    </p>
+    <div id="plan-error"></div>
+    <div class="row" style="margin-top:10px">
+      <label>全网备用总量上限
+        <input type="number" id="reserve-total" min="0" step="1">
+      </label>
+      <span class="hint">所有候选管增设量之和不得超过该上限</span>
+    </div>
+  </section>
+
   <section id="result"></section>
+  <section id="plan-result"></section>
 </main>
 
 <script>
@@ -157,7 +191,17 @@ const state = {
     { id: "p3", from: "N", to: "B", min: 0, preferred: 7, max: 10 },
     { id: "p4", from: "S", to: "A", min: 0, preferred: 0, max: 0 },
   ],
+  plan: { reserve_total: 10 },
 };
+
+// 为管路补齐韧性计划字段（不改动既有 min/preferred/max 语义）
+function planFields(p) {
+  if (p.sel === undefined) p.sel = false;
+  if (p.add_max === undefined) p.add_max = 0;
+  if (p.unit_cost === undefined) p.unit_cost = 1;
+  return p;
+}
+state.pipes.forEach(planFields);
 
 const $ = (id) => document.getElementById(id);
 
@@ -187,6 +231,7 @@ function vertexOptions(selected, kind) {
 function render() {
   $("source-id").value = state.source.id;
   $("source-total").value = state.source.total;
+  $("reserve-total").value = state.plan.reserve_total;
 
   $("zone-body").innerHTML = state.zones.map((z, i) => `
     <tr>
@@ -201,7 +246,13 @@ function render() {
       <td><button class="del" type="button" onclick="removeNode(${i})">删除</button></td>
     </tr>`).join("");
 
-  $("pipe-body").innerHTML = state.pipes.map((p, i) => `
+  $("pipe-body").innerHTML = state.pipes.map((p, i) => {
+    planFields(p);
+    const candInputs = p.sel
+      ? `<span class="cap"><span>增设上限</span><input type="number" class="tiny" min="0" step="1" value="${p.add_max}" onchange="updatePipePlan(${i},'add_max',this.value)"></span>
+         <span class="cap"><span>单位成本</span><input type="number" class="tiny" min="0" step="1" value="${p.unit_cost}" onchange="updatePipePlan(${i},'unit_cost',this.value)"></span>`
+      : "";
+    return `
     <tr class="pipe-row">
       <td><span class="order-tag">${i + 1}</span></td>
       <td><input type="text" value="${esc(p.id)}" onchange="updatePipe(${i},'id',this.value)"></td>
@@ -211,12 +262,17 @@ function render() {
       <td class="num"><input type="number" min="0" step="1" value="${p.min}" onchange="updatePipe(${i},'min',this.value)"></td>
       <td class="num"><input type="number" min="0" step="1" value="${p.preferred}" onchange="updatePipe(${i},'preferred',this.value)"></td>
       <td class="num"><input type="number" min="0" step="1" value="${p.max}" onchange="updatePipe(${i},'max',this.value)"></td>
+      <td class="cand-cell">
+        <label class="cap" style="margin-left:0"><input type="checkbox" ${p.sel ? "checked" : ""} onchange="togglePipeSel(${i},this.checked)"><span>候选</span></label>
+        ${candInputs}
+      </td>
       <td style="white-space:nowrap">
         <button class="del" type="button" title="上移" onclick="movePipe(${i},-1)">↑</button>
         <button class="del" type="button" title="下移" onclick="movePipe(${i},1)">↓</button>
         <button class="del" type="button" onclick="removePipe(${i})">删除</button>
       </td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("");
 
   $("btn-add-zone").disabled = state.zones.length >= 4;
   $("btn-add-node").disabled = state.nodes.length >= 4;
@@ -226,6 +282,7 @@ function render() {
 function syncSource() {
   state.source.id = $("source-id").value.trim();
   state.source.total = Number($("source-total").value);
+  state.plan.reserve_total = Number($("reserve-total").value);
 }
 
 window.updateZone = (i, key, val) => {
@@ -252,6 +309,16 @@ window.updatePipe = (i, key, val) => {
   if (["min", "preferred", "max"].includes(key)) val = Number(val);
   else val = val.trim();
   state.pipes[i][key] = val;
+};
+window.togglePipeSel = (i, on) => {
+  syncSource();
+  planFields(state.pipes[i]);
+  state.pipes[i].sel = on;
+  render();
+};
+window.updatePipePlan = (i, key, val) => {
+  syncSource();
+  state.pipes[i][key] = Number(val);
 };
 window.removePipe = (i) => {
   if (state.pipes.length <= 4) return;
@@ -294,6 +361,8 @@ $("btn-add-pipe").addEventListener("click", () => {
 $("btn-sample").addEventListener("click", () => {
   document.getElementById("result").innerHTML = "";
   document.getElementById("form-error").innerHTML = "";
+  document.getElementById("plan-result").innerHTML = "";
+  document.getElementById("plan-error").innerHTML = "";
   state.source = { id: "S", total: 10 };
   state.zones = [{ id: "A", demand: 6 }, { id: "B", demand: 4 }];
   state.nodes = [{ id: "N" }];
@@ -303,6 +372,8 @@ $("btn-sample").addEventListener("click", () => {
     { id: "p3", from: "N", to: "B", min: 0, preferred: 7, max: 10 },
     { id: "p4", from: "S", to: "A", min: 0, preferred: 0, max: 0 },
   ];
+  state.pipes.forEach(planFields);
+  state.plan = { reserve_total: 10 };
   render();
 });
 
@@ -318,6 +389,19 @@ function buildPayload() {
       min: p.min, max: p.max, preferred: p.preferred,
     })),
   };
+}
+
+function buildPlanPayload() {
+  const payload = buildPayload();
+  payload.reserve_total = state.plan.reserve_total;
+  payload.candidates = state.pipes
+    .filter((p) => p.sel)
+    .map((p) => ({
+      pipe_id: p.id,
+      add_max: p.add_max,
+      unit_cost: p.unit_cost,
+    }));
+  return payload;
 }
 
 function diffCell(d) {
@@ -453,6 +537,148 @@ $("btn-run").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
     btn.textContent = "发起配平";
+  }
+});
+
+function planFlowTable(flows, disabledId) {
+  const rows = flows.map((f) => {
+    const dis = f.pipe_id === disabledId;
+    return `<tr>
+      <td><span class="order-tag">${f.order + 1}</span></td>
+      <td>${esc(f.pipe_id)}${dis ? ' <span class="badge no">停用</span>' : ""}</td>
+      <td>${esc(f.from)} <span class="arrow">→</span> ${esc(f.to)}</td>
+      <td class="num">${f.min}</td>
+      <td class="num">${f.max}</td>
+      <td class="num flow-cell">${f.flow}</td>
+    </tr>`;
+  }).join("");
+  return `<table><thead><tr>
+    <th style="width:34px">#</th><th>管路</th><th>方向</th>
+    <th class="num">最小量</th><th class="num">最大量</th><th class="num">流量</th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function planBalanceTable(balances) {
+  const src = balances.source;
+  const nodes = balances.nodes.map((n) => `
+    <tr><td>${esc(n.id)} <span class="muted">分流节点</span></td>
+      <td class="num">${n.inflow}</td><td class="num">${n.outflow}</td>
+      ${diffCell(n.difference)}</tr>`).join("");
+  const zones = balances.zones.map((z) => `
+    <tr><td>${esc(z.id)} <span class="muted">分区</span></td>
+      <td class="num">${z.inflow}</td><td class="num">${z.demand}</td>
+      ${diffCell(z.difference)}</tr>`).join("");
+  return `<table><thead><tr><th>节点</th><th class="num">流入</th><th class="num">流出/需求</th><th class="num">收-支 差额</th></tr></thead>
+  <tbody>
+    <tr><td>${esc(src.id)} <span class="muted">水源</span></td>
+      <td class="num">—</td><td class="num">${src.outflow} / 总量 ${src.total}</td>
+      ${diffCell(src.difference)}</tr>
+    ${nodes}${zones}
+  </tbody></table>`;
+}
+
+function scenarioBlock(scn) {
+  if (scn.feasible) {
+    return `<div class="scenario">
+      <h3>停用 ${esc(scn.disabled_pipe_id)}　<span class="badge ok">可配平</span></h3>
+      <h4>逐管流量</h4>${planFlowTable(scn.flows, scn.disabled_pipe_id)}
+      <h4>分区 / 节点收支</h4>${planBalanceTable(scn.balances)}
+    </div>`;
+  }
+  const info = scn.infeasibility;
+  const reasons = info.reasons.map((t) => `<li>${esc(t)}</li>`).join("");
+  return `<div class="scenario">
+    <h3>停用 ${esc(scn.disabled_pipe_id)}　<span class="badge no">无法配平</span></h3>
+    <ul class="reasons">${reasons}</ul>
+  </div>`;
+}
+
+function additionsTable(adds) {
+  const rows = adds.map((a) => `<tr>
+    <td><span class="order-tag">${a.order + 1}</span></td>
+    <td>${esc(a.pipe_id)}</td>
+    <td>${esc(a.from)} <span class="arrow">→</span> ${esc(a.to)}</td>
+    <td class="num">${a.add_max}</td>
+    <td class="num">${a.unit_cost}</td>
+    <td class="num flow-cell">${a.amount}</td>
+    <td class="num">${a.line_cost}</td>
+  </tr>`).join("");
+  return `<table><thead><tr>
+    <th style="width:34px">#</th><th>管路</th><th>方向</th>
+    <th class="num">增设上限</th><th class="num">单位成本</th>
+    <th class="num">增设量</th><th class="num">成本</th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderPlan(data) {
+  const adds = additionsTable(data.additions);
+  const scenarios = data.scenarios.map(scenarioBlock).join("");
+  const summary = `
+    <div class="plan-summary">
+      <span>增设总成本 <b>${data.total_cost}</b></span>
+      <span>总增设量 <b>${data.total_added}</b> / 全网备用总量上限 ${data.reserve_total}</span>
+    </div>`;
+  if (data.feasible) {
+    $("plan-result").innerHTML = `
+      <section class="card">
+        <h2 style="margin:0">韧性计划　<span class="badge ok">可行</span></h2>
+        ${summary}
+        <h2 style="margin-top:12px">统一增设方案</h2>
+        ${adds}
+        <h2 style="margin-top:14px">各故障情形配平</h2>
+        ${scenarios}
+      </section>`;
+  } else {
+    const reasons = data.reasons.map((t) => `<li>${esc(t)}</li>`).join("");
+    $("plan-result").innerHTML = `
+      <section class="card">
+        <h2 style="margin:0">韧性计划　<span class="badge no">无解</span></h2>
+        <div class="banner warn">在全网备用总量上限 <b>${data.reserve_total}</b> 内，
+          无法保证所有候选管路单独停用情形下的分区定量供水。</div>
+        <h2>结论与原因</h2>
+        <ul class="reasons">${reasons}</ul>
+        <h2 style="margin-top:12px">限制内覆盖最多故障情形的增设方案</h2>
+        ${summary}
+        ${adds}
+        <h2 style="margin-top:14px">各故障情形配平</h2>
+        ${scenarios}
+      </section>`;
+  }
+}
+
+$("btn-plan").addEventListener("click", async () => {
+  const errBox = $("plan-error");
+  errBox.innerHTML = "";
+  $("plan-result").innerHTML = "";
+  const nSel = state.pipes.filter((p) => p.sel).length;
+  if (nSel < 1 || nSel > 4) {
+    errBox.innerHTML = `<div class="banner error">请在管路表中勾选 1 ~ 4 条候选（可能失效）管路。</div>`;
+    return;
+  }
+  const btn = $("btn-plan");
+  btn.disabled = true;
+  btn.textContent = "计划中…";
+  try {
+    const resp = await fetch("/api/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildPlanPayload()),
+    });
+    const data = await resp.json();
+    if (resp.status === 400) {
+      errBox.innerHTML = `<div class="banner error">计划参数未通过校验：${esc(data.error)}</div>`;
+      return;
+    }
+    if (!resp.ok) {
+      errBox.innerHTML = `<div class="banner error">服务异常（HTTP ${resp.status}），请稍后重试。</div>`;
+      return;
+    }
+    renderPlan(data);
+  } catch (e) {
+    errBox.innerHTML = `<div class="banner error">无法连接计划服务：${esc(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "发起韧性计划";
   }
 });
 
